@@ -1,43 +1,21 @@
-name: fetch-backtest-data
+name: run-backtest
 on:
   workflow_dispatch:
 jobs:
-  fetch:
+  backtest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch history via Yahoo
-        run: |
-          python3 - <<'PYEOF'
-          import requests, json, csv, datetime
-
-          def fetch(sym):
-              p1 = int(datetime.datetime(2020,8,1).timestamp())
-              p2 = int(datetime.datetime(2026,10,20).timestamp())
-              url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-              r = requests.get(url, params={
-                  "period1": p1, "period2": p2,
-                  "interval": "1d", "events": "div,splits"
-              }, headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=30)
-              res = r.json()["chart"]["result"][0]
-              ts = res["timestamp"]
-              q = res["indicators"]["quote"][0]
-              rows = []
-              for i,t in enumerate(ts):
-                  d = datetime.datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
-                  rows.append([d, q["open"][i], q["high"][i], q["low"][i],
-                               q["close"][i], q["volume"][i]])
-              return rows
-
-          for sym, fname in [("MSTR","mstr_yh.csv"), ("BTC-USD","btc_yh.csv")]:
-              rows = fetch(sym)
-              with open(fname,"w",newline="") as f:
-                  w = csv.writer(f)
-                  w.writerow(["Date","Open","High","Low","Close","Volume"])
-                  w.writerows(rows)
-              print(f"{fname}: {len(rows)} rows, {rows[0][0]} to {rows[-1][0]}")
-          PYEOF
-      - uses: actions/upload-artifact@v4
+      - name: Setup
+        run: pip install requests numpy
+      - name: Run mNAV backtest
+        run: python3 backtest.py
+      - name: Upload results
+        uses: actions/upload-artifact@v4
         with:
-          name: history-data
-          path: "*_yh.csv"
+          name: backtest-results
+          path: |
+            mnav_daily.csv
+            nav_curves.csv
+            trades.csv
+            performance.json
