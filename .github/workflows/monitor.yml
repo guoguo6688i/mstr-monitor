@@ -1,0 +1,42 @@
+name: MSTR Premium Monitor
+
+on:
+  schedule:
+    - cron: '30 14 * * *'  # 北京时间 22:30（美股开盘后约1小时）
+    - cron: '50 14 * * *'  # 备用：22:50，防止上一次漏跑（状态去重）
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache state
+        uses: actions/cache@v4
+        with:
+          path: .mstr_last_state.json
+          key: mstr-state-${{ github.run_id }}
+          restore-keys: |
+            mstr-state-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run monitor
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_ENABLED: 'true'
+        run: |
+          python mstr_monitor.py
