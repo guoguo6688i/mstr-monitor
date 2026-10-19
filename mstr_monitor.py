@@ -276,39 +276,54 @@ mNAV 三种口径（区域判断以 Gross 为准）:
     body += "持仓和股本由 mnav.com API 自动同步，加仓/减仓自动反映\n"
     body += "仅供研究参考，不构成投资建议\n"
 
-    # ===== 发送逻辑 =====
+    # ===== 发送逻辑（对 GitHub schedule 延迟免疫）=====
+    # 关键：用“事件类型（GITHUB_EVENT_NAME）”而非运行时钟点判断本次是什么任务，
+    # 这样定时任务即便排队延迟数小时运行，也不会落入兜底分支误发。
     now_utc = datetime.now(_tz.utc)
-    is_daily_slot = now_utc.hour == 14
-    is_intraday = now_utc.hour in (16, 17, 18, 19, 20, 21)
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    is_workday = now_utc.isoweekday() <= 5
 
     sent_date = prev.get("last_daily_date") if prev else None
+    old_major = prev.get("major_zone") if prev else None
+
+    # 例行报告窗口：工作日 UTC 14:30（北京 22:30）之后
+    daily_window_open = is_workday and (
+        now_utc.hour > 14 or (now_utc.hour == 14 and now_utc.minute >= 30)
+    )
+    need_daily = daily_window_open and sent_date != today_utc
+    zone_changed = (old_major is not None) and (major_zone != old_major)
+
     should_send = False
     is_alert = False
+    is_daily = False
     subject = ""
 
-    if is_daily_slot:
-        if sent_date != today_utc:
+    if event_name == "schedule":
+        if need_daily:
+            # 每日例行报告（窗口内任何一次运行发现今天没发，都会补发）
             should_send = True
+            is_daily = True
             subject = f"📊 MSTR【{major_label}·{sub_label}】Gross {gross_mnav:.2f}x ({gross_premium:+.1f}%) | ${mstr_price:,.0f}"
-        else:
-            print("\n  今日例行报告已发送，跳过")
-    elif is_intraday:
-        old_major = prev.get("major_zone") if prev else None
-        if major_zone != old_major:
+            print("\n  定时：发送每日例行报告（含延迟补发）")
+        elif zone_changed:
+            # 区域切换即时预警
             should_send = True
             is_alert = True
             old_major_label = prev.get("major_label", "无记录") if prev else "无记录"
             subject = f"🔔 MSTR区域切换: {old_major_label} → {major_label} | Gross {gross_mnav:.2f}x ({gross_premium:+.1f}%)"
+            print(f"\n  定时：检测到区域切换（{old_major_label} → {major_label}）")
         else:
-            print("\n  盘中检测：操作区域未变化，不发邮件")
+            print("\n  定时：今日例行报告已发且区域未变化，不发邮件")
     else:
+        # 手动触发（workflow_dispatch）或本地运行：发一封当前状态
         should_send = True
         subject = f"📊 MSTR【{major_label}·{sub_label}】Gross {gross_mnav:.2f}x ({gross_premium:+.1f}%) | ${mstr_price:,.0f}"
+        print(f"\n  手动触发/本地（{event_name or 'local'}）：发送当前状态")
 
     if should_send and EMAIL["enabled"]:
-        print("\n  正在发送邮件...")
+        print("  正在发送邮件...")
         ok = send_email(subject, body)
-        if is_daily_slot and ok:
+        if is_daily and ok:
             sent_date = today_utc
 
     # 保存状态
