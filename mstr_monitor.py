@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 MSTR (Strategy / MicroStrategy) 折价率/溢价率监控
-每日运行，自动从 mnav.com 公开 API 获取最新 BTC 持仓和股本数据
+工作日盘中每2小时运行，自动从 mnav.com 公开 API 获取最新 BTC 持仓和股本数据
 （自动反映 MSTR 加仓/减仓/增发，无需手动更新）
+
+邮件按 Gross mNAV（与回测口径一致）直接标注当前处于：
+  加仓区 / 持有区 / 减仓区
 """
 import os
 import json
@@ -22,9 +25,9 @@ FALLBACK = {
     "updated": "2026-10-11",
 }
 
-# 52周 mNAV 历史区间（gross 口径，作为高低参考）
-MNAV_52W_LOW = 0.95
-MNAV_52W_HIGH = 1.43
+# 52周 mNAV 历史区间（Gross 口径，作为高低参考）
+MNAV_52W_LOW = 0.572
+MNAV_52W_HIGH = 1.318
 
 MNAV_API = "https://www.mnav.com/api/companies/summary"
 
@@ -41,6 +44,36 @@ EMAIL = {
 }
 
 STATE_FILE = ".mstr_last_state.json"
+
+
+# ============================================================
+# 操作区间（Gross mNAV，与历史回测口径一致）
+# 三大类：加仓区 / 持有区 / 减仓区
+# ============================================================
+# 每条: (该档阈值下限, 大类id, 大类标签, 细分标签, 操作建议)
+ZONE_BANDS = [
+    (4.0, "reduce", "减仓区", "清仓区",
+     "极度高估，Gross mNAV 超 4.0x，建议清仓或不持有。"),
+    (2.5, "reduce", "减仓区", "减仓区",
+     "严重溢价（2.5~4.0x），建议大幅减仓。"),
+    (1.5, "reduce", "减仓区", "逢高减仓区",
+     "高溢价（1.5~2.5x），高于隐性成本线，持有 BTC 性价比更高，建议逢高减仓/换 BTC。"),
+    (1.0, "hold", "持有区", "持有区",
+     "Gross mNAV 1.0~1.5x，可继续持有；回落至 1.0 以下可加仓。"),
+    (0.8, "accumulate", "加仓区", "分批加仓区",
+     "折价（0.8~1.0x），可分批买入/持有。"),
+    (0.0, "accumulate", "加仓区", "重点加仓区",
+     "深度折价（<0.8x），历史少见，可重点加仓（需排除基本面风险）。"),
+]
+
+
+def get_action_zone(mnav):
+    """返回 (大类id, 大类标签, 细分标签, 操作建议)"""
+    for low, major_id, major_label, sub_label, advice in ZONE_BANDS:
+        if mnav >= low:
+            return major_id, major_label, sub_label, advice
+    last = ZONE_BANDS[-1]
+    return last[1], last[2], last[3], last[4]
 
 
 def send_email(subject, body):
@@ -99,43 +132,12 @@ def get_btc_price_yahoo():
         return None
 
 
-# 阈值区间（基于 gross mNAV，直观口径）
-ZONES = [
-    ("extreme_premium", "极度高溢价（风险高）", 1.40),
-    ("high_premium", "高溢价（偏贵）", 1.20),
-    ("premium", "溢价", 1.10),
-    ("neutral", "接近净资产（中性）", 0.90),
-    ("discount", "折价（相对便宜）", 0.80),
-    ("deep_discount", "深度折价（非常便宜）", 0.0),
-]
-ALERT_ZONES = {"deep_discount", "discount", "high_premium", "extreme_premium"}
-
-
-def get_zone(mnav):
-    for zone_id, name, threshold in ZONES:
-        if mnav >= threshold:
-            return zone_id, name
-    return "deep_discount", "深度折价（非常便宜）"
-
-
-def get_zone_advice(zone_id):
-    advice = {
-        "extreme_premium": "股价大幅高于BTC净资产，追高风险极大，持有者可减仓，空仓者勿追。",
-        "high_premium": "溢价较高，性价比偏低，持有者可逢高减仓，空仓者等待溢价回落。",
-        "premium": "存在一定溢价，可继续持有，不建议追高。",
-        "neutral": "股价接近BTC净资产，估值中性，可持有或观望。",
-        "discount": "股价低于BTC净资产，出现折价，可考虑分批建仓。",
-        "deep_discount": "深度折价，股价显著低于所持BTC价值，历史少见，可重点关注/加仓（需排除基本面风险）。",
-    }
-    return advice.get(zone_id, "")
-
-
 def main():
     print("=" * 60)
     print("  MSTR 折价率/溢价率监控（自动同步持仓）")
     print("=" * 60)
     print(f"  运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  邮件推送: {'已启用' if EMAIL['enabled'] else '未启用'} → {EMAIL['to']}")
+    print(f"  邮件推送: {'已启用' if EMAIL['enabled'] else '未启用'} -> {EMAIL['to']}")
 
     # 获取实时数据
     print("\n  正在获取实时数据...")
@@ -155,9 +157,6 @@ def main():
         btc_change_30d = float(data.get("btcChange30D", 0))
         bps_change_30d = float(data.get("btcPerShareChange30D", 0))
         src = "mnav.com 实时 API"
-        # 推算完全稀释股本
-        shares_fd = btc_held / btc_per_share if btc_per_share else FALLBACK["sharesFD"]
-        data_date = "实时"
         print("  ✅ 已获取实时持仓数据（自动反映加仓/减仓）")
     else:
         # 回退
@@ -172,20 +171,19 @@ def main():
         shares_fd = FALLBACK["sharesFD"]
         btc_per_share = btc_held / shares_fd
         btc_nav = btc_held * btc_price
-        # 股价无法获取，无法计算 mNAV
         print("  ⚠️ 无法获取 MSTR 股价和持仓，仅获取到 BTC 价格")
         return
 
     # ===== 计算两种口径 =====
     # 1. Gross mNAV（市值 / 全部BTC净资产，最直观，未扣债务）
+    #    marketCap 对应 422M 完全稀释股本，与回测口径一致
     gross_mnav = market_cap / btc_nav
     gross_mnav_fd = market_cap_fd / btc_nav
     gross_premium = (gross_mnav - 1) * 100
 
-    # 2. mnav.com 口径（资本结构调整后，反映其 mNAV 指标）
-    # 区间
-    zone_id, zone_name = get_zone(gross_mnav)
-    advice = get_zone_advice(zone_id)
+    # 2. 区域判断（用 Gross mNAV，与回测一致）
+    major_zone, major_label, sub_label, advice = get_action_zone(gross_mnav)
+    zone_name = major_label + "·" + sub_label
 
     # 52周分位
     pct_52w = (gross_mnav - MNAV_52W_LOW) / (MNAV_52W_HIGH - MNAV_52W_LOW) * 100
@@ -199,9 +197,9 @@ def main():
     print(f"  BTC 价格: ${btc_price:,.0f}")
     print(f"  BTC 持仓: {btc_held:,.0f} 枚")
     print("\n" + "-" * 60)
-    print(f"  【当前状态】{zone_name}")
-    print(f"  Gross mNAV: {gross_mnav:.3f}× ({gross_premium:+.1f}%)")
-    print(f"  mnav.com口径: {mnav_theirs:.3f}×")
+    print(f"  【当前处于：{major_label}（{sub_label}）】")
+    print(f"  Gross mNAV: {gross_mnav:.3f}x ({gross_premium:+.1f}%)")
+    print(f"  mnav.com口径: {mnav_theirs:.3f}x")
     print(f"  52周分位: {pct_52w:.0f}%")
     print("-" * 60)
 
@@ -218,22 +216,22 @@ def main():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     today_utc = datetime.now(_tz.utc).strftime("%Y-%m-%d")
 
-    body = f"""MSTR (Strategy) 折价率报告
+    body = f"""MSTR (Strategy) 操作区间报告
 {'=' * 50}
 运行时间: {now_str}（北京时间）
 数据源: {src}（持仓自动同步）
 
-【当前状态】{zone_name}
+★ 当前处于：{major_label}（{sub_label}）
 操作参考: {advice}
 
 价格数据:
   MSTR 股价:   ${mstr_price:,.2f}
   BTC 价格:    ${btc_price:,.0f}
 
-mNAV 两种口径:
-  Gross（市值/全部BTC价值）: {gross_mnav:.3f}×  ({gross_premium:+.1f}%)
-  mnav.com（资本结构调整）:  {mnav_theirs:.3f}×
-  完全稀释 Gross:            {gross_mnav_fd:.3f}×
+mNAV 三种口径（区域判断以 Gross 为准）:
+  Gross（市值/全部BTC价值，回测口径）: {gross_mnav:.3f}x  ({gross_premium:+.1f}%)
+  完全稀释 Gross:                     {gross_mnav_fd:.3f}x
+  mnav.com（资本结构调整）:            {mnav_theirs:.3f}x
 
 每股数据:
   每股 BTC:     {btc_per_share:.6f}（{btc_per_share*1e8:.0f} sats）
@@ -251,25 +249,30 @@ mNAV 两种口径:
   每股BTC变化:  {bps_change_30d:+.2f}%
 
 参考区间:
-  52周 Gross:   {MNAV_52W_LOW}× ~ {MNAV_52W_HIGH}×
+  52周 Gross:   {MNAV_52W_LOW}x ~ {MNAV_52W_HIGH}x
   当前分位:     {pct_52w:.0f}%
 
-预警阈值（Gross口径）:
-  深度折价: mNAV ≤ 0.80（折价≥20%）
-  折价:     mNAV ≤ 0.90
-  高溢价:   mNAV ≥ 1.20
-  极度高溢价: mNAV ≥ 1.40
+操作阈值（Gross mNAV，与回测一致）:
+  加仓区:
+    mNAV < 0.80    重点加仓（深度折价）
+    0.80 ~ 1.00    分批加仓
+  持有区:
+    1.00 ~ 1.50    持有（回落至 1.0 以下加仓）
+  减仓区:
+    1.50 ~ 2.50    逢高减仓 / 换 BTC
+    2.50 ~ 4.00    减仓
+    mNAV > 4.00    清仓
 """
 
     if prev and prev.get("gross_mnav"):
         old = prev["gross_mnav"]
         old_zone = prev.get("zone_name", "")
-        body += f"\n状态变化:\n  上次 Gross: {old:.3f}× ({old_zone})\n  变化: {gross_mnav-old:+.3f}×\n"
+        body += f"\n状态变化:\n  上次 Gross: {old:.3f}x ({old_zone})\n  变化: {gross_mnav-old:+.3f}x\n"
 
     body += "\n" + "=" * 50
     body += "\n口径说明：\n"
-    body += "Gross mNAV = 总市值 / 全部BTC净资产（未扣债务，最直观）\n"
-    body += "mnav.com口径扣除了部分资本结构影响，数值通常更高\n"
+    body += "Gross mNAV = 总市值 / 全部BTC净资产（未扣债务，最直观，与回测一致）\n"
+    body += "mnav.com口径扣除了部分资本结构影响，数值通常更高，仅作参考\n"
     body += "持仓和股本由 mnav.com API 自动同步，加仓/减仓自动反映\n"
     body += "仅供研究参考，不构成投资建议\n"
 
@@ -286,21 +289,21 @@ mNAV 两种口径:
     if is_daily_slot:
         if sent_date != today_utc:
             should_send = True
-            subject = f"📊 MSTR {zone_name} | Gross {gross_mnav:.2f}× ({gross_premium:+.1f}%) | ${mstr_price:,.0f}"
+            subject = f"📊 MSTR【{major_label}·{sub_label}】Gross {gross_mnav:.2f}x ({gross_premium:+.1f}%) | ${mstr_price:,.0f}"
         else:
             print("\n  今日例行报告已发送，跳过")
     elif is_intraday:
-        old_zone = prev.get("zone_id") if prev else None
-        if zone_id != old_zone and zone_id in ALERT_ZONES:
+        old_major = prev.get("major_zone") if prev else None
+        if major_zone != old_major:
             should_send = True
             is_alert = True
-            old_name = prev.get("zone_name", "无记录") if prev else "无记录"
-            subject = f"🔔 MSTR预警: {old_name} → {zone_name} | Gross {gross_mnav:.2f}× ({gross_premium:+.1f}%)"
+            old_major_label = prev.get("major_label", "无记录") if prev else "无记录"
+            subject = f"🔔 MSTR区域切换: {old_major_label} → {major_label} | Gross {gross_mnav:.2f}x ({gross_premium:+.1f}%)"
         else:
-            print("\n  盘中检测：未触发关键阈值，不发邮件")
+            print("\n  盘中检测：操作区域未变化，不发邮件")
     else:
         should_send = True
-        subject = f"📊 MSTR {zone_name} | Gross {gross_mnav:.2f}× ({gross_premium:+.1f}%) | ${mstr_price:,.0f}"
+        subject = f"📊 MSTR【{major_label}·{sub_label}】Gross {gross_mnav:.2f}x ({gross_premium:+.1f}%) | ${mstr_price:,.0f}"
 
     if should_send and EMAIL["enabled"]:
         print("\n  正在发送邮件...")
@@ -315,7 +318,9 @@ mNAV 两种口径:
         "mstr_price": mstr_price,
         "btc_price": btc_price,
         "btc_held": btc_held,
-        "zone_id": zone_id,
+        "major_zone": major_zone,
+        "major_label": major_label,
+        "sub_label": sub_label,
         "zone_name": zone_name,
         "time": datetime.now().isoformat(),
         "last_daily_date": sent_date,
