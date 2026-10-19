@@ -198,17 +198,45 @@ def calc_metrics(mstr_price, btc_price):
 
 
 def get_premium_label(mnav):
-    """根据 mNAV 给出状态标签"""
-    if mnav >= 1.3:
-        return "高溢价（相对偏贵）"
-    elif mnav >= 1.1:
-        return "溢价"
-    elif mnav >= 0.95:
-        return "接近净资产（中性）"
-    elif mnav >= 0.8:
-        return "折价（相对便宜）"
-    else:
-        return "深度折价（非常便宜）"
+    """根据 mNAV 给出状态标签（兼容旧函数）"""
+    zone_id, name = get_zone(mnav)
+    return name
+
+
+# 阈值区间定义（基于 mNAV 倍数）
+# 顺序：从高到低
+ZONES = [
+    ("extreme_premium", "极度高溢价（风险高）", 1.40),
+    ("high_premium", "高溢价（偏贵）", 1.20),
+    ("premium", "溢价", 1.10),
+    ("neutral", "接近净资产（中性）", 0.90),
+    ("discount", "折价（相对便宜）", 0.80),
+    ("deep_discount", "深度折价（非常便宜）", 0.0),
+]
+
+# 需要预警的关键区间（进入这些区间时立即发邮件）
+ALERT_ZONES = {"deep_discount", "discount", "high_premium", "extreme_premium"}
+
+
+def get_zone(mnav):
+    """获取 mNAV 所在区间，返回 (zone_id, 名称)"""
+    for zone_id, name, threshold in ZONES:
+        if mnav >= threshold:
+            return zone_id, name
+    return "deep_discount", "深度折价（非常便宜）"
+
+
+def get_zone_advice(zone_id):
+    """根据区间给出操作建议"""
+    advice = {
+        "extreme_premium": "股价大幅高于 BTC 净资产，追高风险极大，持有者可考虑减仓，空仓者勿追。",
+        "high_premium": "溢价较高，性价比偏低，持有者可逢高减仓，空仓者等待溢价回落。",
+        "premium": "存在一定溢价，可继续持有，不建议追高买入。",
+        "neutral": "股价接近 BTC 净资产，估值中性，可持有或观望。",
+        "discount": "股价低于 BTC 净资产，出现折价，可考虑分批建仓。",
+        "deep_discount": "深度折价，股价显著低于所持 BTC 价值，历史上少见，可重点关注/加仓（需排除基本面风险）。",
+    }
+    return advice.get(zone_id, "")
 
 
 def main():
@@ -260,17 +288,22 @@ def main():
         except Exception:
             pass
 
+    # 当前区间
+    zone_id, zone_name = get_zone(m["mnav_fd"])
+    advice = get_zone_advice(zone_id)
+
     # 构建邮件
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    subject = f"📊 MSTR {label} | mNAV {m['mnav_fd']:.2f}× ({m['premium_fd']:+.1f}%) | 股价${mstr_price:,.0f}"
+    today_utc = datetime.now(_tz.utc).strftime("%Y-%m-%d")
 
-    body = f"""MSTR (Strategy) 每日折价率报告
+    body = f"""MSTR (Strategy) 折价率报告
 {'=' * 50}
 运行时间: {now_str}（北京时间）
 价格时间: {ts}
 数据源: {src}
 
-【当前状态】{label}
+【当前状态】{zone_name}
+操作参考: {advice}
 
 价格数据:
   MSTR 股价:   ${mstr_price:,.2f}
@@ -288,6 +321,12 @@ def main():
   52周 mNAV:    {MNAV_52W_LOW}× ~ {MNAV_52W_HIGH}×
   当前分位:     {m['pct_52w']:.0f}%
 
+预警阈值（完全稀释口径）:
+  深度折价: mNAV ≤ 0.80（折价≥20%）
+  折价:     mNAV ≤ 0.90（折价≥10%）
+  高溢价:   mNAV ≥ 1.20（溢价≥20%）
+  极度高溢价: mNAV ≥ 1.40（溢价≥40%）
+
 公司数据（截至2026-10-11）:
   BTC 持仓:     {BTC_HOLD:,} 枚
   流通股:       {SHARES_BASIC/1e6:.1f}M
@@ -295,15 +334,13 @@ def main():
   平均成本:     ${AVG_COST:,.0f}/BTC
 """
 
-    # 状态变化提醒
+    # 状态变化
     if prev and prev.get("mnav_fd"):
         old_mnav = prev["mnav_fd"]
+        old_zone = prev.get("zone_id", "")
+        old_zone_name = prev.get("label", "")
         change = m["mnav_fd"] - old_mnav
-        old_label = prev.get("label", "")
-        body += f"\n状态变化:\n  上次 mNAV: {old_mnav:.3f}× ({old_label})\n  变化: {change:+.3f}×\n"
-
-        if label != old_label:
-            subject = f"🔔 MSTR状态变化: {old_label} → {label} | mNAV {m['mnav_fd']:.2f}×"
+        body += f"\n状态变化:\n  上次 mNAV: {old_mnav:.3f}× ({old_zone_name})\n  变化: {change:+.3f}×\n"
 
     body += "\n" + "=" * 50
     body += "\n口径说明：mNAV = 股价 / (每股BTC持仓 × BTC价格)\n"
@@ -311,22 +348,43 @@ def main():
     body += "未扣除公司债务/优先股，实际净资产口径见 cebetracker.io\n"
     body += "仅供研究参考，不构成投资建议\n"
 
-    # 每天只发送一次（备用 cron 去重）
-    today_utc = datetime.now(_tz.utc).strftime("%Y-%m-%d")
-    already_sent = prev and prev.get("last_daily_date") == today_utc
+    # ========== 发送逻辑 ==========
+    now_utc = datetime.now(_tz.utc)
+    is_daily_slot = now_utc.hour == 14          # 北京22:30例行报告
+    is_intraday = now_utc.hour in (16, 17, 18, 19, 20, 21)
 
-    # 发送邮件
-    if EMAIL["enabled"]:
-        if already_sent:
-            print("\n  今天已发送过，跳过（备用任务去重）")
+    sent_date = prev.get("last_daily_date") if prev else None
+    should_send = False
+    subject = ""
+    is_alert = False
+
+    if is_daily_slot:
+        # 例行报告：每天必发（去重）
+        if sent_date != today_utc:
+            should_send = True
+            subject = f"📊 MSTR {zone_name} | mNAV {m['mnav_fd']:.2f}× ({m['premium_fd']:+.1f}%) | 股价${mstr_price:,.0f}"
         else:
-            print("\n  正在发送邮件...")
-            ok = send_email(subject, body)
-            sent_date = today_utc if ok else (prev.get("last_daily_date") if prev else None)
-        if already_sent:
-            sent_date = today_utc
+            print("\n  今天例行报告已发送，跳过（备用任务去重）")
+    elif is_intraday:
+        # 盘中检测：区间跨越关键阈值才预警
+        old_zone = prev.get("zone_id") if prev else None
+        if zone_id != old_zone and zone_id in ALERT_ZONES:
+            should_send = True
+            is_alert = True
+            old_name = prev.get("label", "无记录") if prev else "无记录"
+            subject = f"🔔 MSTR预警: {old_name} → {zone_name} | mNAV {m['mnav_fd']:.2f}× ({m['premium_fd']:+.1f}%)"
+        else:
+            print("\n  盘中检测：未触发关键阈值，不发邮件")
     else:
-        sent_date = prev.get("last_daily_date") if prev else None
+        # 手动触发（非定时时段）：总是发送
+        should_send = True
+        subject = f"📊 MSTR {zone_name} | mNAV {m['mnav_fd']:.2f}× ({m['premium_fd']:+.1f}%) | 股价${mstr_price:,.0f}"
+
+    if should_send and EMAIL["enabled"]:
+        print("\n  正在发送邮件...")
+        ok = send_email(subject, body)
+        if is_daily_slot and ok:
+            sent_date = today_utc
 
     # 保存状态
     state = {
@@ -334,7 +392,8 @@ def main():
         "mnav_basic": m["mnav_basic"],
         "mstr_price": mstr_price,
         "btc_price": btc_price,
-        "label": label,
+        "label": zone_name,
+        "zone_id": zone_id,
         "time": datetime.now().isoformat(),
         "last_daily_date": sent_date,
     }
