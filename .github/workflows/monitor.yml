@@ -2,8 +2,10 @@ name: MSTR Premium Monitor
 
 on:
   schedule:
-    - cron: '30 14 * * *'  # 北京时间 22:30（美股开盘后约1小时）
-    - cron: '50 14 * * *'  # 备用：22:50，防止上一次漏跑（状态去重）
+    # 美股工作日盘中每2小时检测（北京时间 22:30, 00:30, 02:30, 04:30）
+    - cron: '30 14,16,18,20 * * 1-5'
+    # 备用：22:50，确保22:30例行报告漏跑时补发
+    - cron: '50 14 * * 1-5'
   workflow_dispatch:
 
 env:
@@ -17,9 +19,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
 
       - name: Cache state
         uses: actions/cache@v4
