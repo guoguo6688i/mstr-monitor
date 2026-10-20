@@ -297,8 +297,16 @@ mNAV 三种口径（区域判断以 Gross 为准）:
     is_alert = False
     is_daily = False
     subject = ""
+    mark_only = os.environ.get("MARK_ONLY", "false").lower() == "true"
 
-    if event_name == "schedule":
+    if mark_only:
+        # 仅标记今日例行已发，不发邮件（用于已手动补发后，防止延迟的 schedule 重复）
+        if daily_window_open:
+            sent_date = today_utc
+            print("\n  标记：今日例行报告已标记为已发送（不发邮件）")
+        else:
+            print("\n  标记：当前不在每日窗口内，不修改")
+    elif event_name == "schedule":
         if need_daily:
             # 每日例行报告（窗口内任何一次运行发现今天没发，都会补发）
             should_send = True
@@ -324,6 +332,9 @@ mNAV 三种口径（区域判断以 Gross 为准）:
         print("  正在发送邮件...")
         ok = send_email(subject, body)
         if is_daily and ok:
+            sent_date = today_utc
+        # 窗口内手动补发也视为今日例行已发，避免延迟的 schedule 再发一封
+        if event_name == "workflow_dispatch" and ok and daily_window_open:
             sent_date = today_utc
 
     # 保存状态

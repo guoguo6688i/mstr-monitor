@@ -8,6 +8,11 @@ on:
     # 备用兜底：22:50（北京），若22:33例行报告漏跑则补发
     - cron: '50 14 * * 1-5'
   workflow_dispatch:
+    inputs:
+      mark_only:
+        description: '仅标记今日例行已发（不发邮件，用于已手动补发后防止重复）'
+        type: boolean
+        default: false
 
 env:
   TZ: Asia/Shanghai
@@ -41,5 +46,6 @@ jobs:
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_ENABLED: 'true'
+          MARK_ONLY: ${{ github.event.inputs.mark_only || 'false' }}
         run: |
           python mstr_monitor.py
